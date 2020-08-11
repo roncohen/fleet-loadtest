@@ -24,6 +24,14 @@ METRICS_INTERVAL=30 TOKEN=... RATE=30 AGENTS=5000 go run main.go
 
 ### Interpreting the stats
 
+There are 4 types of requests that agents make:
+1. enroll
+1. first check in - from the Agent perspective, it's just a regular check-in, but we keep it as a separate metric here because they are typically extra heavy
+1. ack - acknowledge changes to the configuration that we received in the check in
+1. check in - subsequent check-ins to the first one.
+
+
+
 500 enrolled and this shows the timings:
 ```
 2020/08/11 13:21:30 timer requests.latency.enroll
@@ -136,4 +144,12 @@ Currently zero ongoing ACK requests
 ```
 2020/08/11 13:21:30 counter requests.concurrent_count.ack
 2020/08/11 13:21:30   count:               0
+```
+
+
+## Interpreting log output
+
+Regular socket timeout happened before fleet send back a response OR you're trying to speak regular HTTP to a HTTPS endpoint. That simulated agent will back off for 10s.
+```
+2020/08/11 13:24:34 checkin: err: checkin: Post "https://localhost:5601/api/ingest_manager/fleet/agents/99/checkin": EOF, backoff: 10s
 ```
