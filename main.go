@@ -322,14 +322,14 @@ func backoff(ctx context.Context, task string, f func() (interface{}, error)) (i
 	}
 }
 
-func runagent(ctx context.Context, agentName string, checkinTimeout time.Duration, token, host string) error {
+func runagent(ctx context.Context, agentName string, logger *log.Logger, checkinTimeout time.Duration, token, host string) error {
 	apiKeyInt, err := backoff(ctx, "enroll", func() (interface{}, error) {
 		return enroll(ctx, agentName, host, token)
 	})
 	if err != nil {
 		return errors.Wrap(err, "enrolling")
 	}
-	fmt.Printf("%s enrolled..\n", agentName)
+	logger.Printf("%s enrolled..\n", agentName)
 	apiKey, ok := apiKeyInt.(string)
 	if !ok {
 		return errors.New("assigning api key")
@@ -342,7 +342,7 @@ func runagent(ctx context.Context, agentName string, checkinTimeout time.Duratio
 	if err != nil {
 		return errors.Wrap(err, "checking in first time")
 	}
-	fmt.Printf("%s checked in first time...\n", agentName)
+	logger.Printf("%s checked in first time...\n", agentName)
 
 	for {
 		select {
@@ -356,7 +356,7 @@ func runagent(ctx context.Context, agentName string, checkinTimeout time.Duratio
 			if err != nil {
 				return err
 			}
-			fmt.Printf("%s checked in...\n", agentName)
+			logger.Printf("%s checked in...\n", agentName)
 		}
 	}
 }
@@ -366,11 +366,20 @@ func main() {
 	token := os.Getenv("TOKEN")
 	host := os.Getenv("HOST")
 	rate := os.Getenv("RATE")
+	logLots := os.Getenv("LOG_LOTS")
 	metricsInterval := os.Getenv("METRICS_INTERVAL")
 
 	if agents == "" || token == "" {
 		println("missing AGENTS or TOKEN")
 		return
+	}
+
+	var logger *log.Logger
+
+	if logLots == "" {
+		logger = log.New(ioutil.Discard, "", log.LstdFlags)
+	} else {
+		logger = log.New(os.Stdout, "", log.LstdFlags)
 	}
 
 	if host == "" {
@@ -401,7 +410,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	enrollDelay := time.Second / time.Duration(ratei)
 	checkinFreq := time.Millisecond * 1
-	fmt.Printf("using enroll delay: %s\n", enrollDelay)
+	log.Printf("using enroll delay: %s\n", enrollDelay)
 
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt)
@@ -429,7 +438,7 @@ outOfFor:
 		wg.Add(1)
 		go func() {
 			agentName := fmt.Sprintf("agent-%d", j)
-			err := runagent(ctx, agentName, checkinFreq, token, host)
+			err := runagent(ctx, agentName, logger, checkinFreq, token, host)
 			if err != nil && errors.Cause(err) != context.Canceled {
 				fmt.Printf("stopping %s, err: %s\n", agentName, err)
 			}
@@ -444,6 +453,7 @@ outOfFor:
 		}
 	}
 	if !brokeOut {
+		log.Printf("agents started...\n")
 		<-c
 	}
 

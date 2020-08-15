@@ -22,6 +22,11 @@ Print metrics every 30s. Set to zero to disable printing metrics.
 METRICS_INTERVAL=30 TOKEN=... RATE=30 AGENTS=5000 go run main.go
 ```
 
+Log everything every agent does:
+```
+LOG_LOTS=1 TOKEN=... RATE=30 AGENTS=5000 go run main.go
+```
+
 ### Interpreting the stats
 
 There are 4 types of requests that agents make:
