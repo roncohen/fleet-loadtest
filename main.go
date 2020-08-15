@@ -64,10 +64,10 @@ func init() {
 }
 
 func request(req *http.Request, reqName string) (*http.Response, error) {
-	t := metrics.GetOrRegisterTimer("requests.latency."+reqName, nil)
+	t := metrics.GetOrRegisterTimer("requests."+reqName+".latency", nil)
 	var resp *http.Response
 	var err error
-	c := metrics.GetOrRegisterCounter("requests.concurrent_count."+reqName, nil)
+	c := metrics.GetOrRegisterCounter("requests."+reqName+".concurrent_count", nil)
 	c.Inc(1)
 	t.Time(func() {
 		resp, err = client.Do(req)
@@ -168,7 +168,7 @@ func checkin(ctx context.Context, agentName string, host string, apiKey string, 
 		configManager.Set(agentName, revision)
 	}
 
-	me := metrics.GetOrRegisterMeter("requests.success.checkin", nil)
+	me := metrics.GetOrRegisterMeter("requests.checkin.success", nil)
 	me.Mark(1)
 
 	metrics.GetOrRegisterCounter("actions.received", nil).Inc(int64(len(acks)))
@@ -199,11 +199,30 @@ func checkin(ctx context.Context, agentName string, host string, apiKey string, 
 	return nil
 }
 
-func timeit() func() time.Duration {
-	now := time.Now()
-	return func() time.Duration {
-		return time.Now().Sub(now)
+func measureHealthCheck(ctx context.Context, host string) error {
+	for {
+		select {
+		case <-time.After(time.Second):
+			req, err := http.NewRequestWithContext(ctx, "GET", host+"/api/status", nil)
+			req.Header.Add("Content-type", "application/json")
+			req.Header.Add("kbn-xsrf", "false")
+
+			resp, err := request(req, "healthcheck")
+			if err == nil {
+				if resp.StatusCode < 300 {
+					metrics.GetOrRegisterMeter("requests.healthcheck.success", nil).Mark(1)
+				} else {
+					metrics.GetOrRegisterMeter(fmt.Sprintf("requests.healthcheck.fail.%d", resp.StatusCode), nil).Mark(1)
+				}
+				continue
+			}
+			log.Printf("healthcheck failed: %v", err)
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+
 	}
+
 }
 
 func printMetrics() {
@@ -273,7 +292,7 @@ func printMetrics() {
 
 	log.Printf("Policy revision summary")
 	for k, v := range revision_summary {
-		log.Printf("  %d:   %12\n", k, v)
+		log.Printf("  %d:   %12d\n", k, v)
 	}
 }
 
@@ -397,6 +416,12 @@ func main() {
 			}
 		}()
 	}
+
+	wg.Add(1)
+	go func() {
+		measureHealthCheck(ctx, host)
+		wg.Done()
+	}()
 
 outOfFor:
 	for i := 0; i < agentsi; i++ {
