@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -29,6 +30,7 @@ type policyCounter struct {
 
 func (c *policyCounter) Set(agentName string, revision int) {
 	c.Lock()
+
 	prevRev, ok := c.revisionsByAgent[agentName]
 	if ok {
 		c.revisionsSummary[prevRev]--
@@ -202,7 +204,7 @@ func checkin(ctx context.Context, agentName string, host string, apiKey string, 
 	return nil
 }
 
-func measureHealthCheck(ctx context.Context, host string) error {
+func measureHealthCheck(ctx context.Context, host string, auth string) error {
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, syscall.SIGUSR1)
 
@@ -212,6 +214,9 @@ func measureHealthCheck(ctx context.Context, host string) error {
 			req, err := http.NewRequestWithContext(ctx, "GET", host+"/api/status", nil)
 			req.Header.Add("Content-type", "application/json")
 			req.Header.Add("kbn-xsrf", "false")
+
+			splitAuth := strings.Split(auth, ":")
+			req.SetBasicAuth(splitAuth[0], splitAuth[1])
 
 			resp, err := request(req, "healthcheck")
 			if err == nil {
@@ -306,7 +311,7 @@ func printMetrics() {
 	}
 }
 
-func backoff(ctx context.Context, task string, f func() (interface{}, error)) (interface{}, error) {
+func backoff(ctx context.Context, task string, logger *log.Logger, f func() (interface{}, error)) (interface{}, error) {
 	timeout := 5
 	for {
 		out, err := f()
@@ -333,7 +338,7 @@ func backoff(ctx context.Context, task string, f func() (interface{}, error)) (i
 }
 
 func runagent(ctx context.Context, agentName string, logger *log.Logger, checkinTimeout time.Duration, token, host string) error {
-	apiKeyInt, err := backoff(ctx, "enroll", func() (interface{}, error) {
+	apiKeyInt, err := backoff(ctx, "enroll", logger, func() (interface{}, error) {
 		return enroll(ctx, agentName, host, token)
 	})
 	if err != nil {
@@ -345,7 +350,7 @@ func runagent(ctx context.Context, agentName string, logger *log.Logger, checkin
 		return errors.New("assigning api key")
 	}
 
-	_, err = backoff(ctx, "first checkin", func() (interface{}, error) {
+	_, err = backoff(ctx, "first checkin", logger, func() (interface{}, error) {
 		err = checkin(ctx, agentName, host, apiKey, true)
 		return nil, err
 	})
@@ -359,7 +364,7 @@ func runagent(ctx context.Context, agentName string, logger *log.Logger, checkin
 		case <-ctx.Done():
 			return nil
 		case <-time.After(checkinTimeout):
-			_, err = backoff(ctx, "checkin", func() (interface{}, error) {
+			_, err = backoff(ctx, "checkin", logger, func() (interface{}, error) {
 				err = checkin(ctx, agentName, host, apiKey, false)
 				return nil, err
 			})
@@ -378,6 +383,7 @@ func main() {
 	rate := os.Getenv("RATE")
 	logLots := os.Getenv("LOG_LOTS")
 	metricsInterval := os.Getenv("METRICS_INTERVAL")
+	auth := os.Getenv("ELASTIC_AUTH")
 
 	if agents == "" || token == "" {
 		println("missing AGENTS or TOKEN")
@@ -390,6 +396,10 @@ func main() {
 		logger = log.New(ioutil.Discard, "", log.LstdFlags)
 	} else {
 		logger = log.New(os.Stdout, "", log.LstdFlags)
+	}
+
+	if auth == "" {
+		auth = "elastic:changeme"
 	}
 
 	if host == "" {
@@ -438,7 +448,7 @@ func main() {
 
 	wg.Add(1)
 	go func() {
-		measureHealthCheck(ctx, host)
+		measureHealthCheck(ctx, host, auth)
 		wg.Done()
 	}()
 
