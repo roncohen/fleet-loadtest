@@ -20,6 +20,38 @@ import (
 	"github.com/rcrowley/go-metrics"
 )
 
+type ConfigManager struct {
+	sync.Mutex
+	revisions_by_agent map[string]int
+	revisions_summary  map[int]int
+}
+
+func (c *ConfigManager) Set(agentName string, revision int) {
+	c.Lock()
+	prev_rev, ok := c.revisions_by_agent[agentName]
+	if ok {
+		c.revisions_summary[prev_rev]--
+	}
+	c.revisions_by_agent[agentName] = revision
+	c.revisions_summary[revision]++
+	c.Unlock()
+}
+
+func (c *ConfigManager) Summary() map[int]int {
+	new_summary := map[int]int{}
+	c.Lock()
+	for k, v := range c.revisions_summary {
+		new_summary[k] = v
+	}
+	c.Unlock()
+	return new_summary
+}
+
+var configManager = ConfigManager{
+	revisions_by_agent: map[string]int{},
+	revisions_summary:  map[int]int{},
+}
+
 var errUnexpectedStatusCode = errors.New("unexpected status code")
 var client *http.Client
 
@@ -44,8 +76,8 @@ func request(req *http.Request, reqName string) (*http.Response, error) {
 	return resp, err
 }
 
-func enroll(ctx context.Context, i int, host, token string) (string, error) {
-	reqBody := fmt.Sprintf(`{"type": "PERMANENT", "metadata": {"user_provided": {}, "local": {"elastic": {"agent": {"version": "7.9.0"}}, "host": {"hostname": "fake-%d"}}}}`, i)
+func enroll(ctx context.Context, agentName string, host, token string) (string, error) {
+	reqBody := fmt.Sprintf(`{"type": "PERMANENT", "metadata": {"user_provided": {}, "local": {"elastic": {"agent": {"version": "7.9.0"}}, "host": {"hostname": "%s"}}}}`, agentName)
 
 	req, err := http.NewRequestWithContext(ctx, "POST", host+"/api/ingest_manager/fleet/agents/enroll", bytes.NewBufferString(reqBody))
 	req.Header.Add("Content-type", "application/json")
@@ -81,7 +113,7 @@ func enroll(ctx context.Context, i int, host, token string) (string, error) {
 	return out["item"].(map[string]interface{})["access_api_key"].(string), nil
 }
 
-func checkin(ctx context.Context, host string, apiKey string, first bool) error {
+func checkin(ctx context.Context, agentName string, host string, apiKey string, first bool) error {
 	reqBody := `{}`
 	req, err := http.NewRequestWithContext(ctx, "POST", host+"/api/ingest_manager/fleet/agents/99/checkin", bytes.NewBufferString(reqBody))
 	req.Header.Add("Content-type", "application/json")
@@ -131,10 +163,15 @@ func checkin(ctx context.Context, host string, apiKey string, first bool) error 
 			"message":   "config change acked",
 			"action_id": b["id"],
 		})
+
+		revision := int(b["data"].(map[string]interface{})["config"].(map[string]interface{})["revision"].(float64))
+		configManager.Set(agentName, revision)
 	}
 
 	me := metrics.GetOrRegisterMeter("requests.success.checkin", nil)
 	me.Mark(1)
+
+	metrics.GetOrRegisterCounter("actions.received", nil).Inc(int64(len(acks)))
 
 	if len(acks) > 0 {
 		reqMap := map[string]interface{}{"events": acks}
@@ -231,6 +268,13 @@ func printMetrics() {
 			log.Printf("  mean rate:   %12.2f\n", t.RateMean())
 		}
 	})
+
+	revision_summary := configManager.Summary()
+
+	log.Printf("Policy revision summary")
+	for k, v := range revision_summary {
+		log.Printf("  %d:   %12\n", k, v)
+	}
 }
 
 func backoff(ctx context.Context, task string, f func() (interface{}, error)) (interface{}, error) {
@@ -259,27 +303,27 @@ func backoff(ctx context.Context, task string, f func() (interface{}, error)) (i
 	}
 }
 
-func runagent(ctx context.Context, i int, checkinTimeout time.Duration, token, host string) error {
+func runagent(ctx context.Context, agentName string, checkinTimeout time.Duration, token, host string) error {
 	apiKeyInt, err := backoff(ctx, "enroll", func() (interface{}, error) {
-		return enroll(ctx, i, host, token)
+		return enroll(ctx, agentName, host, token)
 	})
 	if err != nil {
 		return errors.Wrap(err, "enrolling")
 	}
-	fmt.Printf("fake-%d enrolled..\n", i)
+	fmt.Printf("%s enrolled..\n", agentName)
 	apiKey, ok := apiKeyInt.(string)
 	if !ok {
 		return errors.New("assigning api key")
 	}
 
 	_, err = backoff(ctx, "first checkin", func() (interface{}, error) {
-		err = checkin(ctx, host, apiKey, true)
+		err = checkin(ctx, agentName, host, apiKey, true)
 		return nil, err
 	})
 	if err != nil {
 		return errors.Wrap(err, "checking in first time")
 	}
-	fmt.Printf("fake-%d checked in first time...\n", i)
+	fmt.Printf("%s checked in first time...\n", agentName)
 
 	for {
 		select {
@@ -287,13 +331,13 @@ func runagent(ctx context.Context, i int, checkinTimeout time.Duration, token, h
 			return nil
 		case <-time.After(checkinTimeout):
 			_, err = backoff(ctx, "checkin", func() (interface{}, error) {
-				err = checkin(ctx, host, apiKey, false)
+				err = checkin(ctx, agentName, host, apiKey, false)
 				return nil, err
 			})
 			if err != nil {
 				return err
 			}
-			fmt.Printf("fake-%d checked in...\n", i)
+			fmt.Printf("%s checked in...\n", agentName)
 		}
 	}
 }
@@ -356,12 +400,13 @@ func main() {
 
 outOfFor:
 	for i := 0; i < agentsi; i++ {
-		j := i
+		j := i // copy is required here
 		wg.Add(1)
 		go func() {
-			err := runagent(ctx, j, checkinFreq, token, host)
+			agentName := fmt.Sprintf("agent-%d", j)
+			err := runagent(ctx, agentName, checkinFreq, token, host)
 			if err != nil && errors.Cause(err) != context.Canceled {
-				fmt.Printf("stopping fake agent-%d, err: %s\n", i, err)
+				fmt.Printf("stopping %s, err: %s\n", agentName, err)
 			}
 			wg.Done()
 		}()
