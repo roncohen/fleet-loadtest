@@ -22,6 +22,11 @@ import (
 	"github.com/rcrowley/go-metrics"
 )
 
+type agent struct {
+	id     string
+	apiKey string
+}
+
 type policyCounter struct {
 	sync.Mutex
 	revisionsByAgent map[string]int
@@ -79,7 +84,7 @@ func request(req *http.Request, reqName string) (*http.Response, error) {
 	return resp, err
 }
 
-func enroll(ctx context.Context, agentName string, host, token string) (string, error) {
+func enroll(ctx context.Context, agentName string, host, token string) (agent, error) {
 	reqBody := fmt.Sprintf(`{"type": "PERMANENT", "metadata": {"user_provided": {}, "local": {"elastic": {"agent": {"version": "7.9.0"}}, "host": {"hostname": "%s"}}}}`, agentName)
 
 	req, err := http.NewRequestWithContext(ctx, "POST", host+"/api/ingest_manager/fleet/agents/enroll", bytes.NewBufferString(reqBody))
@@ -89,38 +94,58 @@ func enroll(ctx context.Context, agentName string, host, token string) (string, 
 
 	resp, err := request(req, "enroll")
 	if err != nil {
-		return "", errors.Wrap(err, "enrolling")
+		return agent{}, errors.Wrap(err, "enrolling")
 	}
 	if resp.StatusCode == 429 {
-		return "", errors.Wrap(errUnexpectedStatusCode, fmt.Sprintf("code: %d", resp.StatusCode))
+		return agent{}, errors.Wrap(errUnexpectedStatusCode, fmt.Sprintf("code: %d", resp.StatusCode))
 	}
 
 	if resp.StatusCode != 200 {
 		body, err := ioutil.ReadAll(resp.Body)
 		if err != nil {
-			return "", errors.Wrap(err, "err while reading non 200 response body")
+			return agent{}, errors.Wrap(err, "err while reading non 200 response body")
 		}
-		return "", errors.Wrap(errUnexpectedStatusCode, fmt.Sprintf("code: %d, body: %s", resp.StatusCode, body))
+		return agent{}, errors.Wrap(errUnexpectedStatusCode, fmt.Sprintf("code: %d, body: %s", resp.StatusCode, body))
 	}
 
 	b, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		return "", errors.Wrap(err, "reading response")
+		return agent{}, errors.Wrap(err, "reading response")
 	}
 
 	var out map[string]interface{}
 	err = json.Unmarshal(b, &out)
 	if err != nil {
-		return "", errors.Wrap(err, "decoding response")
+		return agent{}, errors.Wrap(err, "decoding response")
 	}
-	return out["item"].(map[string]interface{})["access_api_key"].(string), nil
+	return agent{
+		id:     out["item"].(map[string]interface{})["id"].(string),
+		apiKey: out["item"].(map[string]interface{})["access_api_key"].(string),
+	}, nil
 }
 
-func checkin(ctx context.Context, agentName string, host string, apiKey string, first bool) error {
+func checkin(ctx context.Context, agentName string, agent agent, host string, first bool) error {
 	reqBody := `{}`
-	req, err := http.NewRequestWithContext(ctx, "POST", host+"/api/ingest_manager/fleet/agents/99/checkin", bytes.NewBufferString(reqBody))
+	if first {
+		reqBody = fmt.Sprintf(`{
+	"events": [{
+			"type": "STATE",
+			"subtype": "RUNNING",
+			"message": "state changed from STOPPED to RUNNING",
+			"timestamp": "%s",
+			"payload": {
+				"random": "data",
+				"state": "RUNNING",
+				"previous_state": "STOPPED"
+			},
+			"agent_id": "%s"
+		}]
+	}`, time.Now().Format(time.RFC3339), agent.id)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", fmt.Sprintf("%s/api/ingest_manager/fleet/agents/%s/checkin", host, agent.id), bytes.NewBufferString(reqBody))
 	req.Header.Add("Content-type", "application/json")
-	req.Header.Add("Authorization", fmt.Sprintf("ApiKey %s", apiKey))
+	req.Header.Add("Authorization", fmt.Sprintf("ApiKey %s", agent.apiKey))
 	req.Header.Add("kbn-xsrf", "false")
 
 	var metricName string
@@ -154,7 +179,6 @@ func checkin(ctx context.Context, agentName string, host string, apiKey string, 
 	}
 
 	actions := out["actions"].([]interface{})
-	var agentID string
 	acks := []map[string]interface{}{}
 	for _, a := range actions {
 		b := a.(map[string]interface{})
@@ -170,7 +194,9 @@ func checkin(ctx context.Context, agentName string, host string, apiKey string, 
 		revision := int(b["data"].(map[string]interface{})["config"].(map[string]interface{})["revision"].(float64))
 		policies.Set(agentName, revision)
 
-		agentID = b["agent_id"].(string)
+		if b["agent_id"].(string) != agent.id {
+			panic("agent id mismatch, bummer")
+		}
 	}
 
 	me := metrics.GetOrRegisterMeter("requests.checkin.success", nil)
@@ -186,9 +212,9 @@ func checkin(ctx context.Context, agentName string, host string, apiKey string, 
 			return errors.Wrap(err, "marshalling acks")
 		}
 
-		req, err := http.NewRequestWithContext(ctx, "POST", fmt.Sprintf("%s/api/ingest_manager/fleet/agents/%s/acks", host, agentID), bytes.NewBuffer(b))
+		req, err := http.NewRequestWithContext(ctx, "POST", fmt.Sprintf("%s/api/ingest_manager/fleet/agents/%s/acks", host, agent.id), bytes.NewBuffer(b))
 		req.Header.Add("Content-type", "application/json")
-		req.Header.Add("Authorization", fmt.Sprintf("ApiKey %s", apiKey))
+		req.Header.Add("Authorization", fmt.Sprintf("ApiKey %s", agent.apiKey))
 		req.Header.Add("kbn-xsrf", "false")
 
 		_, err = request(req, "ack")
@@ -228,7 +254,8 @@ func measureHealthCheck(ctx context.Context, host string, auth string) error {
 				}
 				continue
 			}
-			log.Printf("healthcheck failed: %v", err)
+
+			return err
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-c:
@@ -308,7 +335,7 @@ func printMetrics() {
 	revisionSummary := policies.Summary()
 	log.Printf("Policy revision summary")
 	for k, v := range revisionSummary {
-		log.Printf("  %d:   %12d\n", k, v)
+		log.Printf("  revision %2d:   %4d agents\n", k, v)
 	}
 }
 
@@ -339,20 +366,17 @@ func backoff(ctx context.Context, task string, logger *log.Logger, f func() (int
 }
 
 func runagent(ctx context.Context, agentName string, logger *log.Logger, token, host string) error {
-	apiKeyInt, err := backoff(ctx, "enroll", logger, func() (interface{}, error) {
+	agentInf, err := backoff(ctx, "enroll", logger, func() (interface{}, error) {
 		return enroll(ctx, agentName, host, token)
 	})
 	if err != nil {
 		return errors.Wrap(err, "enrolling")
 	}
+	agent := agentInf.(agent)
 	logger.Printf("%s enrolled..\n", agentName)
-	apiKey, ok := apiKeyInt.(string)
-	if !ok {
-		return errors.New("assigning api key")
-	}
 
 	_, err = backoff(ctx, "first checkin", logger, func() (interface{}, error) {
-		err = checkin(ctx, agentName, host, apiKey, true)
+		err = checkin(ctx, agentName, agent, host, true)
 		return nil, err
 	})
 	if err != nil {
@@ -366,7 +390,7 @@ func runagent(ctx context.Context, agentName string, logger *log.Logger, token, 
 			return nil
 		case <-time.After(time.Second):
 			_, err = backoff(ctx, "checkin", logger, func() (interface{}, error) {
-				err = checkin(ctx, agentName, host, apiKey, false)
+				err = checkin(ctx, agentName, agent, host, false)
 				return nil, err
 			})
 			if err != nil {
@@ -418,7 +442,7 @@ func main() {
 	host := os.Getenv("HOST")
 	rate := os.Getenv("RATE")
 	logLots := os.Getenv("LOG_LOTS")
-	auth := os.Getenv("ELASTIC_AUTH")
+	auth := os.Getenv("KIBANA_AUTH")
 	stopAfter, err := parseENVDuration("STOP_AFTER", "0")
 	if err != nil {
 		fmt.Printf("err: %s", err)
@@ -502,7 +526,10 @@ func main() {
 
 	wg.Add(1)
 	go func() {
-		measureHealthCheck(ctx, host, auth)
+		err := measureHealthCheck(ctx, host, auth)
+		if err != context.Canceled {
+			log.Printf("healthcheck failed: %v", err)
+		}
 		wg.Done()
 	}()
 
