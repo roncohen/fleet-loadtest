@@ -338,7 +338,7 @@ func backoff(ctx context.Context, task string, logger *log.Logger, f func() (int
 	}
 }
 
-func runagent(ctx context.Context, agentName string, logger *log.Logger, checkinTimeout time.Duration, token, host string) error {
+func runagent(ctx context.Context, agentName string, logger *log.Logger, token, host string) error {
 	apiKeyInt, err := backoff(ctx, "enroll", logger, func() (interface{}, error) {
 		return enroll(ctx, agentName, host, token)
 	})
@@ -364,7 +364,7 @@ func runagent(ctx context.Context, agentName string, logger *log.Logger, checkin
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-time.After(checkinTimeout):
+		case <-time.After(time.Second):
 			_, err = backoff(ctx, "checkin", logger, func() (interface{}, error) {
 				err = checkin(ctx, agentName, host, apiKey, false)
 				return nil, err
@@ -377,14 +377,59 @@ func runagent(ctx context.Context, agentName string, logger *log.Logger, checkin
 	}
 }
 
+func parseENVDuration(envvar string, defaultValue string) (time.Duration, error) {
+	val := os.Getenv(envvar)
+
+	if val == "" {
+		val = defaultValue
+	}
+
+	parsedDuration, err := time.ParseDuration(val)
+	if err != nil {
+		return 0, errors.Wrapf(err, "parsing %s: %s", envvar, val)
+	}
+
+	return parsedDuration, nil
+}
+
+func startAgents(ctx context.Context, agentCount int, wg *sync.WaitGroup, enrollDelay time.Duration, logger *log.Logger, token, host string) {
+	for i := 0; i < agentCount; i++ {
+		j := i // copy is required here
+		wg.Add(1)
+		go func() {
+			agentName := fmt.Sprintf("agent-%d", j)
+			err := runagent(ctx, agentName, logger, token, host)
+			if err != nil && errors.Cause(err) != context.Canceled {
+				fmt.Printf("stopping %s, err: %s\n", agentName, err)
+			}
+			wg.Done()
+		}()
+
+		select {
+		case <-ctx.Done():
+		case <-time.After(enrollDelay):
+		}
+	}
+}
+
 func main() {
 	agents := os.Getenv("AGENTS")
 	token := os.Getenv("TOKEN")
 	host := os.Getenv("HOST")
 	rate := os.Getenv("RATE")
 	logLots := os.Getenv("LOG_LOTS")
-	metricsInterval := os.Getenv("METRICS_INTERVAL")
 	auth := os.Getenv("ELASTIC_AUTH")
+	stopAfter, err := parseENVDuration("STOP_AFTER", "0")
+	if err != nil {
+		fmt.Printf("err: %s", err)
+		return
+	}
+
+	metricsInterval, err := parseENVDuration("METRICS_INTERVAL", "30s")
+	if err != nil {
+		fmt.Printf("err: %s", err)
+		return
+	}
 
 	if agents == "" || token == "" {
 		println("missing AGENTS or TOKEN")
@@ -407,19 +452,9 @@ func main() {
 		host = "http://localhost:5601"
 	}
 
-	if metricsInterval == "" {
-		metricsInterval = "30s"
-	}
-
 	agentsi, err := strconv.Atoi(agents)
 	if err != nil {
 		fmt.Printf("err parsing AGENTS %s: %s", agents, err)
-		return
-	}
-
-	metricsIntervali, err := time.ParseDuration(metricsInterval)
-	if err != nil {
-		fmt.Printf("err parsing METRICS_INTERVAL %s: %s", agents, err)
 		return
 	}
 
@@ -430,18 +465,36 @@ func main() {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	enrollDelay := time.Second / time.Duration(ratei)
-	checkinFreq := time.Millisecond * 1
 	log.Printf("using enroll delay: %s\n", enrollDelay)
 
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt)
 	wg := sync.WaitGroup{}
-	brokeOut := false
 
-	if metricsIntervali > 0 {
+	go func() {
+		select {
+		case <-c:
+			fmt.Println("aborting")
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	if stopAfter > 0 {
+		go func() {
+			select {
+			case <-time.After(stopAfter):
+				fmt.Printf("stopping after %s\n", stopAfter)
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
+	}
+
+	if metricsInterval > 0 {
 		go func() {
 			for {
-				time.Sleep(metricsIntervali)
+				time.Sleep(metricsInterval)
 				printMetrics()
 			}
 		}()
@@ -453,33 +506,15 @@ func main() {
 		wg.Done()
 	}()
 
-outOfFor:
-	for i := 0; i < agentsi; i++ {
-		j := i // copy is required here
-		wg.Add(1)
-		go func() {
-			agentName := fmt.Sprintf("agent-%d", j)
-			err := runagent(ctx, agentName, logger, checkinFreq, token, host)
-			if err != nil && errors.Cause(err) != context.Canceled {
-				fmt.Printf("stopping %s, err: %s\n", agentName, err)
-			}
-			wg.Done()
-		}()
+	startAgents(ctx, agentsi, &wg, enrollDelay, logger, token, host)
 
-		select {
-		case <-c:
-			brokeOut = true
-			break outOfFor
-		case <-time.After(enrollDelay):
-		}
-	}
-	if !brokeOut {
+	select {
+	case <-ctx.Done():
+	default:
 		log.Printf("agents started...\n")
-		<-c
 	}
 
-	fmt.Println("aborting")
-	cancel()
+	<-ctx.Done()
 
 	wg.Wait()
 	printMetrics()
