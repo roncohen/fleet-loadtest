@@ -14,42 +14,43 @@ import (
 	"os/signal"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/pkg/errors"
 	"github.com/rcrowley/go-metrics"
 )
 
-type ConfigManager struct {
+type policyCounter struct {
 	sync.Mutex
-	revisions_by_agent map[string]int
-	revisions_summary  map[int]int
+	revisionsByAgent map[string]int
+	revisionsSummary map[int]int
 }
 
-func (c *ConfigManager) Set(agentName string, revision int) {
+func (c *policyCounter) Set(agentName string, revision int) {
 	c.Lock()
-	prev_rev, ok := c.revisions_by_agent[agentName]
+	prevRev, ok := c.revisionsByAgent[agentName]
 	if ok {
-		c.revisions_summary[prev_rev]--
+		c.revisionsSummary[prevRev]--
 	}
-	c.revisions_by_agent[agentName] = revision
-	c.revisions_summary[revision]++
+	c.revisionsByAgent[agentName] = revision
+	c.revisionsSummary[revision]++
 	c.Unlock()
 }
 
-func (c *ConfigManager) Summary() map[int]int {
-	new_summary := map[int]int{}
+func (c *policyCounter) Summary() map[int]int {
+	newSummary := map[int]int{}
 	c.Lock()
-	for k, v := range c.revisions_summary {
-		new_summary[k] = v
+	for k, v := range c.revisionsSummary {
+		newSummary[k] = v
 	}
 	c.Unlock()
-	return new_summary
+	return newSummary
 }
 
-var configManager = ConfigManager{
-	revisions_by_agent: map[string]int{},
-	revisions_summary:  map[int]int{},
+var policies = policyCounter{
+	revisionsByAgent: map[string]int{},
+	revisionsSummary: map[int]int{},
 }
 
 var errUnexpectedStatusCode = errors.New("unexpected status code")
@@ -151,7 +152,7 @@ func checkin(ctx context.Context, agentName string, host string, apiKey string, 
 	}
 
 	actions := out["actions"].([]interface{})
-	var agentId string
+	var agentID string
 	acks := []map[string]interface{}{}
 	for _, a := range actions {
 		b := a.(map[string]interface{})
@@ -165,9 +166,9 @@ func checkin(ctx context.Context, agentName string, host string, apiKey string, 
 		})
 
 		revision := int(b["data"].(map[string]interface{})["config"].(map[string]interface{})["revision"].(float64))
-		configManager.Set(agentName, revision)
+		policies.Set(agentName, revision)
 
-		agentId = b["agent_id"].(string)
+		agentID = b["agent_id"].(string)
 	}
 
 	me := metrics.GetOrRegisterMeter("requests.checkin.success", nil)
@@ -183,7 +184,7 @@ func checkin(ctx context.Context, agentName string, host string, apiKey string, 
 			return errors.Wrap(err, "marshalling acks")
 		}
 
-		req, err := http.NewRequestWithContext(ctx, "POST", fmt.Sprintf("%s/api/ingest_manager/fleet/agents/%s/acks", host, agentId), bytes.NewBuffer(b))
+		req, err := http.NewRequestWithContext(ctx, "POST", fmt.Sprintf("%s/api/ingest_manager/fleet/agents/%s/acks", host, agentID), bytes.NewBuffer(b))
 		req.Header.Add("Content-type", "application/json")
 		req.Header.Add("Authorization", fmt.Sprintf("ApiKey %s", apiKey))
 		req.Header.Add("kbn-xsrf", "false")
@@ -202,6 +203,9 @@ func checkin(ctx context.Context, agentName string, host string, apiKey string, 
 }
 
 func measureHealthCheck(ctx context.Context, host string) error {
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, syscall.SIGUSR1)
+
 	for {
 		select {
 		case <-time.After(time.Second):
@@ -221,6 +225,11 @@ func measureHealthCheck(ctx context.Context, host string) error {
 			log.Printf("healthcheck failed: %v", err)
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-c:
+			metrics.Unregister("requests.healthcheck.success")
+			metrics.Unregister("requests.healthcheck.latency")
+			metrics.Unregister("requests.healthcheck.concurrent_count")
+			log.Println("reset healthcheck metrics due to SIGUSR1")
 		}
 
 	}
@@ -290,10 +299,9 @@ func printMetrics() {
 		}
 	})
 
-	revision_summary := configManager.Summary()
-
+	revisionSummary := policies.Summary()
 	log.Printf("Policy revision summary")
-	for k, v := range revision_summary {
+	for k, v := range revisionSummary {
 		log.Printf("  %d:   %12d\n", k, v)
 	}
 }
