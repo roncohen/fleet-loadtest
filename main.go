@@ -151,7 +151,7 @@ func checkin(ctx context.Context, agentName string, host string, apiKey string, 
 	}
 
 	actions := out["actions"].([]interface{})
-
+	var agentId string
 	acks := []map[string]interface{}{}
 	for _, a := range actions {
 		b := a.(map[string]interface{})
@@ -166,6 +166,8 @@ func checkin(ctx context.Context, agentName string, host string, apiKey string, 
 
 		revision := int(b["data"].(map[string]interface{})["config"].(map[string]interface{})["revision"].(float64))
 		configManager.Set(agentName, revision)
+
+		agentId = b["agent_id"].(string)
 	}
 
 	me := metrics.GetOrRegisterMeter("requests.checkin.success", nil)
@@ -181,7 +183,7 @@ func checkin(ctx context.Context, agentName string, host string, apiKey string, 
 			return errors.Wrap(err, "marshalling acks")
 		}
 
-		req, err := http.NewRequestWithContext(ctx, "POST", host+"/api/ingest_manager/fleet/agents/999/acks", bytes.NewBuffer(b))
+		req, err := http.NewRequestWithContext(ctx, "POST", fmt.Sprintf("%s/api/ingest_manager/fleet/agents/%s/acks", host, agentId), bytes.NewBuffer(b))
 		req.Header.Add("Content-type", "application/json")
 		req.Header.Add("Authorization", fmt.Sprintf("ApiKey %s", apiKey))
 		req.Header.Add("kbn-xsrf", "false")
