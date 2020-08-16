@@ -331,12 +331,15 @@ func measureHealthCheck(ctx context.Context, host string, auth string) error {
 
 }
 
-func printMetrics() {
+func printMetrics(filter string) {
 	scale := time.Millisecond
 	du := float64(scale)
 	duSuffix := scale.String()[1:]
 
 	metrics.DefaultRegistry.Each(func(name string, i interface{}) {
+		if len(filter) > 0 && !strings.Contains(name, filter) {
+			return
+		}
 		switch metric := i.(type) {
 		case metrics.Counter:
 			log.Printf("counter %s\n", name)
@@ -506,6 +509,8 @@ func main() {
 	rate := os.Getenv("RATE")
 	logLots := os.Getenv("LOG_LOTS")
 	auth := os.Getenv("KIBANA_AUTH")
+	extendedMetrics := os.Getenv("EXTENDED_METRICS")
+
 	stopAfter, err := parseENVDuration("STOP_AFTER", "0")
 	if err != nil {
 		fmt.Printf("err: %s", err)
@@ -551,6 +556,11 @@ func main() {
 		return
 	}
 
+	filter := "healthcheck"
+	if extendedMetrics != "" {
+		filter = ""
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	enrollDelay := time.Second / time.Duration(ratei)
 	log.Printf("using enroll delay: %s\n", enrollDelay)
@@ -562,7 +572,7 @@ func main() {
 			select {
 			case state := <-stateMachine.Changed():
 				log.Printf("state changed: %s, elapsed: %s", state, stateMachine.Elapsed())
-				printMetrics()
+				printMetrics(filter)
 			case <-ctx.Done():
 				return
 			}
@@ -580,6 +590,7 @@ func main() {
 			cancel()
 		case <-ctx.Done():
 		}
+
 	}()
 
 	if stopAfter > 0 {
@@ -597,7 +608,7 @@ func main() {
 		go func() {
 			for {
 				time.Sleep(metricsInterval)
-				printMetrics()
+				printMetrics(filter)
 			}
 		}()
 	}
@@ -622,6 +633,6 @@ func main() {
 	<-ctx.Done()
 
 	wg.Wait()
-	printMetrics()
+	printMetrics(filter)
 
 }
