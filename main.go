@@ -510,6 +510,7 @@ func main() {
 	logLots := os.Getenv("LOG_LOTS")
 	auth := os.Getenv("KIBANA_AUTH")
 	extendedMetrics := os.Getenv("EXTENDED_METRICS")
+	stopWhenIdle := os.Getenv("STOP_WHEN_IDLE")
 
 	stopAfter, err := parseENVDuration("STOP_AFTER", "0")
 	if err != nil {
@@ -573,6 +574,11 @@ func main() {
 			case state := <-stateMachine.Changed():
 				log.Printf("state changed: %s, elapsed: %s", state, stateMachine.Elapsed())
 				printMetrics(filter)
+
+				if stopWhenIdle != "" && state == testStateIdle {
+					cancel()
+					return
+				}
 			case <-ctx.Done():
 				return
 			}

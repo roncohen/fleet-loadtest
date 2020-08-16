@@ -33,6 +33,13 @@ EXTENDED_METRICS=1 TOKEN=... RATE=30 AGENTS=5000 go run main.go
 ```
 
 
+If you only want to run a "enroll" test and just exist when all agents have enrolled and gotten their first policy, you can use "STOP_WHEN_IDLE":
+```
+STOP_WHEN_IDLE=1 TOKEN=... RATE=30 AGENTS=5000 go run main.go
+```
+
+NOTE: If you set `LOG_LOTS`, `EXTENDED_METRICS`, `STOP_WHEN_IDLE` to anything, they will count as enabled. E.g. "off", "on", "1", "0" all means _enabled_.
+
 ### Interpreting the stats
 
 There are 4 types of requests that agents make:
@@ -40,8 +47,6 @@ There are 4 types of requests that agents make:
 1. first check in - from the Agent perspective, it's just a regular check-in, but we keep it as a separate metric here because they are typically extra heavy
 1. ack - acknowledge changes to the configuration that we received in the check in
 1. check in - subsequent check-ins to the first one.
-
-
 
 500 enrolled and this shows the timings:
 ```
