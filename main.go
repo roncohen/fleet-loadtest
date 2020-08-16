@@ -80,36 +80,44 @@ type testStateMachine struct {
 	state                  testState
 	agentPolicyUpdateCount int32
 	totalAgents            int
-	stateChanged           chan testState
+	stateChangedChan       chan testState
+	resetTime              time.Time
 }
 
 func (s *testStateMachine) PolicyUpdated() {
 	newVal := atomic.AddInt32(&s.agentPolicyUpdateCount, 1)
 	if newVal == int32(s.totalAgents) {
 		s.state = testStateIdle
-		s.stateChanged <- testStateIdle
+		s.stateChangedChan <- testStateIdle
 	}
 }
 
 func (s *testStateMachine) Changed() <-chan testState {
-	return s.stateChanged
+	return s.stateChangedChan
 }
 
 func (s *testStateMachine) Reset() {
+	s.resetTime = time.Now()
 	s.agentPolicyUpdateCount = 0
 	s.state = testStatePolicyChanging
 }
 
-func newTestStateMachine(agentCount int) testStateMachine {
-	return testStateMachine{
-		state:                  testStatePolicyChanging,
-		agentPolicyUpdateCount: 0,
-		stateChanged:           make(chan testState, 1),
-		totalAgents:            agentCount,
-	}
+func (s *testStateMachine) Elapsed() time.Duration {
+	return time.Now().Sub(s.resetTime)
 }
 
-var stateMachine testStateMachine
+func newTestStateMachine(agentCount int) *testStateMachine {
+	stateMachine := testStateMachine{
+		state:                  testStatePolicyChanging,
+		agentPolicyUpdateCount: 0,
+		stateChangedChan:       make(chan testState, 1),
+		totalAgents:            agentCount,
+	}
+	stateMachine.Reset()
+	return &stateMachine
+}
+
+var stateMachine *testStateMachine
 
 var errUnexpectedStatusCode = errors.New("unexpected status code")
 var client *http.Client
@@ -291,7 +299,7 @@ func measureHealthCheck(ctx context.Context, host string, auth string) error {
 
 	for {
 		select {
-		case <-time.After(time.Second):
+		case <-time.After(time.Millisecond * 500):
 			req, err := http.NewRequestWithContext(ctx, "GET", host+"/api/status", nil)
 			req.Header.Add("Content-type", "application/json")
 			req.Header.Add("kbn-xsrf", "false")
@@ -553,7 +561,7 @@ func main() {
 		for {
 			select {
 			case state := <-stateMachine.Changed():
-				log.Println("state changed:", state)
+				log.Printf("state changed: %s, elapsed: %s", state, stateMachine.Elapsed())
 				printMetrics()
 			case <-ctx.Done():
 				return
