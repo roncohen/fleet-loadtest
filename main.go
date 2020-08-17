@@ -15,7 +15,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -32,6 +31,10 @@ type policyCounter struct {
 	sync.Mutex
 	revisionsByAgent map[string]int
 	revisionsSummary map[int]int
+
+	totalAgents int
+
+	stateMachine *testStateMachine
 }
 
 func (c *policyCounter) Set(agentName string, revision int) {
@@ -43,6 +46,11 @@ func (c *policyCounter) Set(agentName string, revision int) {
 	}
 	c.revisionsByAgent[agentName] = revision
 	c.revisionsSummary[revision]++
+
+	if c.revisionsSummary[revision] == c.totalAgents {
+		c.stateMachine.SetState(testStateIdle)
+	}
+
 	c.Unlock()
 }
 
@@ -56,15 +64,11 @@ func (c *policyCounter) Summary() map[int]int {
 	return newSummary
 }
 
-var policies = policyCounter{
-	revisionsByAgent: map[string]int{},
-	revisionsSummary: map[int]int{},
-}
+var policies policyCounter
 
 type testState string
 
 const (
-	// testStateEnrolling      testState = "enrolling"
 	testStatePolicyChanging testState = "policy-changing"
 	testStateIdle           testState = "idle"
 )
@@ -72,24 +76,13 @@ const (
 type agentEvent string
 
 const (
-	// agentEventEnrolled      agentEvent = "enrolled"
 	agentEventPolicyChanged agentEvent = "policy-updated"
 )
 
 type testStateMachine struct {
-	state                  testState
-	agentPolicyUpdateCount int32
-	totalAgents            int
-	stateChangedChan       chan testState
-	resetTime              time.Time
-}
-
-func (s *testStateMachine) PolicyUpdated() {
-	newVal := atomic.AddInt32(&s.agentPolicyUpdateCount, 1)
-	if newVal == int32(s.totalAgents) {
-		s.state = testStateIdle
-		s.stateChangedChan <- testStateIdle
-	}
+	state            testState
+	stateChangedChan chan testState
+	resetTime        time.Time
 }
 
 func (s *testStateMachine) Changed() <-chan testState {
@@ -98,7 +91,6 @@ func (s *testStateMachine) Changed() <-chan testState {
 
 func (s *testStateMachine) Reset() {
 	s.resetTime = time.Now()
-	s.agentPolicyUpdateCount = 0
 	s.state = testStatePolicyChanging
 }
 
@@ -106,12 +98,16 @@ func (s *testStateMachine) Elapsed() time.Duration {
 	return time.Now().Sub(s.resetTime)
 }
 
-func newTestStateMachine(agentCount int) *testStateMachine {
+func (s *testStateMachine) SetState(testState testState) {
+	s.state = testState
+	s.stateChangedChan <- testState
+}
+
+func newTestStateMachine() *testStateMachine {
 	stateMachine := testStateMachine{
-		state:                  testStatePolicyChanging,
-		agentPolicyUpdateCount: 0,
-		stateChangedChan:       make(chan testState, 1),
-		totalAgents:            agentCount,
+		state: testStatePolicyChanging,
+
+		stateChangedChan: make(chan testState, 1),
 	}
 	stateMachine.Reset()
 	return &stateMachine
@@ -119,7 +115,22 @@ func newTestStateMachine(agentCount int) *testStateMachine {
 
 var stateMachine *testStateMachine
 
-var errUnexpectedStatusCode = errors.New("unexpected status code")
+type statusCodeErr struct {
+	statusCode int
+}
+
+func (s statusCodeErr) Error() string {
+	return "unexpected status code"
+}
+
+func (s statusCodeErr) StatusCode() int {
+	return s.statusCode
+}
+
+func unexpectedErr(statusCode int) error {
+	return statusCodeErr{statusCode}
+}
+
 var client *http.Client
 
 func init() {
@@ -283,9 +294,6 @@ func checkin(ctx context.Context, agentName string, agent agent, host string, fi
 		me := metrics.GetOrRegisterMeter("requests.ack.success", nil)
 		me.Mark(1)
 		metrics.GetOrRegisterCounter("actions.acked", nil).Inc(int64(len(acks)))
-
-		// policy got updated, so notify the global state
-		stateMachine.PolicyUpdated()
 	}
 	/*
 	   "action":"checkin","success":true,"actions":[{"agent_id":"11288846-856a-4ac0-9bff-508ea67d6ae0","type":"CONFIG_CHANGE","data":{"config":{"id":"3cd91180-a1b6-11ea-9403-6590bcd4d4db","outputs":{"default":{"type":"elasticsearch","hosts":["http://localhost:9200"],"api_key":"bJBBYXIBWeuISmdwual8:1YWEw5XcTT-KhWkaJrRZLw"}},"datasources":[{"id":"5377a050-a1b6-11ea-9403-6590bcd4d4db","name":"system-1","namespace":"default","enabled":true,"use_output":"default","inputs":[{"type":"logs","enabled":true,"streams":[{"id":"logs-system.auth","enabled":true,"dataset":"system.auth","paths":["/var/log/auth.log*","/var/log/secure*"],"exclude_files":[".gz$"],"multiline":{"pattern":"^\\s","match":"after"},"processors":[{"add_locale":null},{"add_fields":{"target":"","fields":{"ecs.version":"1.5.0"}}}]},{"id":"logs-system.syslog","enabled":true,"dataset":"system.syslog","paths":["/var/log/messages*","/var/log/syslog*"],"exclude_files":[".gz$"],"multiline":{"pattern":"^\\s","match":"after"},"processors":[{"add_locale":null},{"add_fields":{"target":"","fields":{"ecs.version":"1.5.0"}}}]}]},{"type":"system/metrics","enabled":true,"streams":[{"id":"system/metrics-system.core","enabled":true,"dataset":"system.core","metricsets":["core"],"core.metrics":"percentages"},{"id":"system/metrics-system.cpu","enabled":true,"dataset":"system.cpu","metricsets":["cpu"],"core.metrics":"percentages","cpu.metrics":"percentages,normalized_percentages","period":"10s","process.include_top_n.by_cpu":5,"process.include_top_n.by_memory":5,"processes":".*"},{"id":"system/metrics-system.diskio","enabled":true,"dataset":"system.diskio","metricsets":["diskio"]},{"id":"system/metrics-system.entropy","enabled":true,"dataset":"system.entropy","metricsets":["entropy"]},{"id":"system/metrics-system.filesystem","enabled":true,"dataset":"system.filesystem","metricsets":["filesystem"],"period":"1m","processors":[{"drop_event.when.regexp":{"system.filesystem.mount_point":"^/(sys|cgroup|proc|dev|etc|host|lib|snap)($|/)"}}]},{"id":"system/metrics-system.fsstat","enabled":true,"dataset":"system.fsstat","metricsets":["fsstat"],"period":"1m","processors":[{"drop_event.when.regexp":{"system.filesystem.mount_point":"^/(sys|cgroup|proc|dev|etc|host|lib|snap)($|/)"}}]},{"id":"system/metrics-system.load","enabled":true,"dataset":"system.load","metricsets":["load"],"core.metrics":"percentages","cpu.metrics":"percentages,normalized_percentages","period":"10s","process.include_top_n.by_cpu":5,"process.include_top_n.by_memory":5,"processes":".*"},{"id":"system/metrics-system.memory","enabled":true,"dataset":"system.memory","metricsets":["memory"],"core.metrics":"percentages","cpu.metrics":"percentages,normalized_percentages","period":"10s","process.include_top_n.by_cpu":5,"process.include_top_n.by_memory":5,"processes":".*"},{"id":"system/metrics-system.network","enabled":true,"dataset":"system.network","metricsets":["network"],"core.metrics":"percentages","cpu.metrics":"percentages,normalized_percentages","period":"10s","process.include_top_n.by_cpu":5,"process.include_top_n.by_memory":5,"processes":".*"},{"id":"system/metrics-system.network_summary","enabled":true,"dataset":"system.network_summary","metricsets":["network_summary"]},{"id":"system/metrics-system.process","enabled":true,"dataset":"system.process","metricsets":["process"],"core.metrics":"percentages","cpu.metrics":"percentages,normalized_percentages","period":"10s","process.include_top_n.by_cpu":5,"process.include_top_n.by_memory":5,"processes":".*"},{"id":"system/metrics-system.process_summary","enabled":true,"dataset":"system.process_summary","metricsets":["process_summary"],"core.metrics":"percentages","cpu.metrics":"percentages,normalized_percentages","period":"10s","process.include_top_n.by_cpu":5,"process.include_top_n.by_memory":5,"processes":".*"},{"id":"system/metrics-system.raid","enabled":true,"dataset":"system.raid","metricsets":["raid"]},{"id":"system/metrics-system.service","enabled":true,"dataset":"system.service","metricsets":["service"]},{"id":"system/metrics-system.socket","enabled":true,"dataset":"system.socket","metricsets":["socket"]},{"id":"system/metrics-system.socket_summary","enabled":true,"dataset":"system.socket_summary","metricsets":["socket_summary"],"core.metrics":"percentages","cpu.metrics":"percentages,normalized_percentages","period":"10s","process.include_top_n.by_cpu":5,"process.include_top_n.by_memory":5,"processes":".*"},{"id":"system/metrics-system.uptime","enabled":true,"dataset":"system.uptime","metricsets":["uptime"],"core.metrics":"percentages","cpu.metrics":"percentages,normalized_percentages","period":"10s","processes":".*"},{"id":"system/metrics-system.users","enabled":true,"dataset":"system.users","metricsets":["users"]}]}],"package":{"name":"system","version":"0.1.0"}}],"revision":2,"settings":{"monitoring":{"use_output":"default","enabled":true,"logs":true,"metrics":true}}}},"id":"cb59b298-388b-4b76-a924-3974551354c7","created_at":"2020-05-29T16:26:37.191Z"}]}
@@ -566,7 +574,14 @@ func main() {
 	enrollDelay := time.Second / time.Duration(ratei)
 	log.Printf("using enroll delay: %s\n", enrollDelay)
 
-	stateMachine = newTestStateMachine(agentsi)
+	stateMachine = newTestStateMachine()
+
+	policies = policyCounter{
+		revisionsByAgent: map[string]int{},
+		revisionsSummary: map[int]int{},
+		totalAgents:      agentsi,
+		stateMachine:     stateMachine,
+	}
 
 	go func() {
 		for {
