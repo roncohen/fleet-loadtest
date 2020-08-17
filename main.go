@@ -10,6 +10,7 @@ import (
 	"log"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -120,7 +121,7 @@ type statusCodeErr struct {
 }
 
 func (s statusCodeErr) Error() string {
-	return "unexpected status code"
+	return fmt.Sprintf("unexpected status code: %d", s.statusCode)
 }
 
 func (s statusCodeErr) StatusCode() int {
@@ -149,6 +150,9 @@ func request(req *http.Request, reqName string) (*http.Response, error) {
 	c.Inc(1)
 	t.Time(func() {
 		resp, err = client.Do(req)
+		if err != nil {
+			err = err.(*url.Error).Err
+		}
 	})
 	c.Dec(1)
 	return resp, err
@@ -435,12 +439,19 @@ func backoff(ctx context.Context, task string, logger *log.Logger, f func() (int
 	timeout := 5
 	for {
 		out, err := f()
-		if err == context.Canceled {
+		if errors.Cause(err) == context.Canceled {
 			return nil, err
 		}
 
 		if err == nil {
 			return out, nil
+		}
+
+		if statusErr, ok := err.(interface{ StatusCode() int }); ok {
+			metrics.GetOrRegisterCounter(fmt.Sprintf("requests.%s.failure.%d", task, statusErr.StatusCode()), nil).Inc(1)
+			logger.Printf("%s: err: %s, backoff: %ds\n", task, err, timeout)
+		} else {
+			log.Printf("%s: err: %s, backoff: %ds\n", task, err, timeout)
 		}
 
 		select {
@@ -453,10 +464,7 @@ func backoff(ctx context.Context, task string, logger *log.Logger, f func() (int
 		if timeout > 600 {
 			timeout = 600
 		}
-		if statusErr, ok := err.(interface{ StatusCode() int }); ok {
-			metrics.GetOrRegisterCounter(fmt.Sprintf("requests.%s.failure.%d", task, statusErr.StatusCode()), nil).Inc(1)
-		}
-		logger.Printf("%s: err: %s, backoff: %ds\n", task, err, timeout)
+
 	}
 }
 
