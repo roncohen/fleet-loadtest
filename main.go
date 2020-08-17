@@ -252,21 +252,31 @@ func checkin(ctx context.Context, agentName string, agent agent, host string, fi
 	acks := []map[string]interface{}{}
 	for _, a := range actions {
 		b := a.(map[string]interface{})
-		acks = append(acks, map[string]interface{}{
-			"type":      "ACTION_RESULT",
-			"subtype":   "ACKNOWLEDGED",
-			"agent_id":  b["agent_id"],
-			"timestamp": time.Now().Format(time.RFC3339),
-			"message":   "config change acked",
-			"action_id": b["id"],
-		})
 
-		revision := int(b["data"].(map[string]interface{})["config"].(map[string]interface{})["revision"].(float64))
-		policies.Set(agentName, revision)
+		data, ok := b["data"].(map[string]interface{})
+		if ok {
+			config, ok := data["config"].(map[string]interface{})
+			if ok {
+				revision := int(config["revision"].(float64))
 
-		if b["agent_id"].(string) != agent.id {
-			panic("agent id mismatch, bummer")
+				acks = append(acks, map[string]interface{}{
+					"type":      "ACTION_RESULT",
+					"subtype":   "ACKNOWLEDGED",
+					"agent_id":  b["agent_id"],
+					"timestamp": time.Now().Format(time.RFC3339),
+					"message":   "config change acked",
+					"action_id": b["id"],
+				})
+
+				policies.Set(agentName, revision)
+
+				if b["agent_id"].(string) != agent.id {
+					panic("agent id mismatch, bummer")
+				}
+				continue
+			}
 		}
+
 	}
 
 	me := metrics.GetOrRegisterMeter("requests.checkin.success", nil)
