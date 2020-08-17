@@ -170,6 +170,7 @@ func enroll(ctx context.Context, agentName string, host, token string) (agent, e
 	if err != nil {
 		return agent{}, errors.Wrap(err, "enrolling")
 	}
+	defer resp.Body.Close()
 	if resp.StatusCode == 429 {
 		return agent{}, unexpectedErr(resp.StatusCode)
 	}
@@ -232,6 +233,7 @@ func checkin(ctx context.Context, agentName string, agent agent, host string, fi
 	if err != nil {
 		return errors.Wrap(err, metricName)
 	}
+	defer checkinResp.Body.Close()
 
 	if checkinResp.StatusCode != 200 {
 		body, err := ioutil.ReadAll(checkinResp.Body)
@@ -301,10 +303,11 @@ func checkin(ctx context.Context, agentName string, agent agent, host string, fi
 		req.Header.Add("Authorization", fmt.Sprintf("ApiKey %s", agent.apiKey))
 		req.Header.Add("kbn-xsrf", "false")
 
-		_, err = request(req, "ack")
+		resp, err := request(req, "ack")
 		if err != nil {
 			return errors.Wrap(err, "acking")
 		}
+		defer resp.Body.Close()
 		me := metrics.GetOrRegisterMeter("requests.ack.success", nil)
 		me.Mark(1)
 		metrics.GetOrRegisterCounter("actions.acked", nil).Inc(int64(len(acks)))
@@ -331,6 +334,7 @@ func measureHealthCheck(ctx context.Context, host string, auth string) error {
 
 			resp, err := request(req, "healthcheck")
 			if err == nil {
+				defer resp.Body.Close()
 				if resp.StatusCode < 300 {
 					metrics.GetOrRegisterMeter("requests.healthcheck.success", nil).Mark(1)
 				} else {
