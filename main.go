@@ -167,15 +167,15 @@ func enroll(ctx context.Context, agentName string, host, token string) (agent, e
 		return agent{}, errors.Wrap(err, "enrolling")
 	}
 	if resp.StatusCode == 429 {
-		return agent{}, errors.Wrap(errUnexpectedStatusCode, fmt.Sprintf("code: %d", resp.StatusCode))
+		return agent{}, unexpectedErr(resp.StatusCode)
 	}
 
 	if resp.StatusCode != 200 {
-		body, err := ioutil.ReadAll(resp.Body)
+		_, err := ioutil.ReadAll(resp.Body)
 		if err != nil {
 			return agent{}, errors.Wrap(err, "err while reading non 200 response body")
 		}
-		return agent{}, errors.Wrap(errUnexpectedStatusCode, fmt.Sprintf("code: %d, body: %s", resp.StatusCode, body))
+		return agent{}, unexpectedErr(resp.StatusCode)
 	}
 
 	b, err := ioutil.ReadAll(resp.Body)
@@ -434,7 +434,10 @@ func backoff(ctx context.Context, task string, logger *log.Logger, f func() (int
 		if timeout > 600 {
 			timeout = 600
 		}
-		log.Printf("%s: err: %s, backoff: %ds\n", task, err, timeout)
+		if statusErr, ok := err.(interface{ StatusCode() int }); ok {
+			metrics.GetOrRegisterCounter(fmt.Sprintf("requests.%s.failure.%d", task, statusErr.StatusCode()), nil).Inc(1)
+		}
+		logger.Printf("%s: err: %s, backoff: %ds\n", task, err, timeout)
 	}
 }
 
