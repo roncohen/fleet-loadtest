@@ -300,7 +300,7 @@ func measureHealthCheck(ctx context.Context, host string, auth string) error {
 	for {
 		select {
 		case <-time.After(time.Millisecond * 500):
-			req, err := http.NewRequestWithContext(ctx, "GET", host+"/api/status", nil)
+			req, err := http.NewRequestWithContext(ctx, "GET", host+"/api/features", nil)
 			req.Header.Add("Content-type", "application/json")
 			req.Header.Add("kbn-xsrf", "false")
 
