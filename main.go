@@ -421,12 +421,15 @@ func printMetrics(filter []string) {
 	duSuffix := scale.String()[1:]
 
 	metrics.DefaultRegistry.Each(func(name string, i interface{}) {
-		if len(filter) > 0 {
-			for _, f := range filter {
-				if strings.Contains(name, f) {
-					printMetric(name, i, du, duSuffix)
-					return
-				}
+		if filter == nil {
+			printMetric(name, i, du, duSuffix)
+			return
+		}
+
+		for _, f := range filter {
+			if strings.Contains(name, f) {
+				printMetric(name, i, du, duSuffix)
+				return
 			}
 		}
 
@@ -601,7 +604,7 @@ func main() {
 
 	filter := []string{"healthcheck", "fail"}
 	if extendedMetrics != "" {
-		filter = []string{}
+		filter = nil
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
